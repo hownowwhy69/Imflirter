@@ -1,13 +1,13 @@
-# Session Manager Pro — Python 3.10+
+# Session Manager Pro — pin Python 3.12 on Render (.python-version)
 # Bot UI (Pyrogram-compatible maintained fork; drop-in `import pyrogram`)
 pyrofork>=2.3.45
 tgcrypto>=1.2.5
 
-# Account / session engine
-telethon>=1.36.0
+# Account / session engine (1.40+ still works on 3.12; keep a floor)
+telethon>=1.36.0,<1.41.0
 
-# TData / TDesktop conversion (optional — bot still runs if this fails to install)
-opentele>=1.15.1
+# TData / TDesktop conversion (needs Python <= 3.12)
+opentele==1.15.1
 PyQt5>=5.15.10
 
 # Database
