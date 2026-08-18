@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: session-manager-pro
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.11.9"
+      - key: KEEP_ALIVE_INTERVAL
+        value: "45"
+      # Optional: set after first deploy if RENDER_EXTERNAL_URL is missing
+      # - key: KEEP_ALIVE_URL
+      #   value: https://YOUR-APP.onrender.com
+      
