@@ -744,8 +744,27 @@ def classify_error(exc: BaseException) -> str | None:
     return None
 
 
+def make_user_client(session=None, api_id: int | None = None) -> TelegramClient:
+    """Build a Telethon user client.
+
+    opentele patches TelegramClient.__init__(session, api=...). A positional
+    API_ID (int) then lands in `api` and later send_code_request blows up with
+    "bytes or str expected, not int". Always pass api_id/api_hash by name.
+    """
+    if session is None:
+        session = StringSession()
+    elif isinstance(session, str):
+        session = StringSession(session)
+    aid = int(api_id or API_ID)
+    ahash = str(API_HASH)
+    client = TelegramClient(session, api_id=aid, api_hash=ahash, **_DEV)
+    client.api_id = aid
+    client.api_hash = ahash
+    return client
+
+
 def tg_from_string(s: str, api_id: int | None = None) -> TelegramClient:
-    return TelegramClient(StringSession(s), int(api_id or API_ID), API_HASH, **_DEV)
+    return make_user_client(s, api_id)
 
 
 @asynccontextmanager
@@ -782,7 +801,7 @@ async def inspect_client(client: TelegramClient) -> dict:
 
 
 async def inspect_parts(parts: SessionParts) -> dict:
-    c = TelegramClient(StringSession(parts.telethon_string()), int(parts.api_id or API_ID), API_HASH, **_DEV)
+    c = make_user_client(parts.telethon_string(), parts.api_id)
     async with opened(c):
         info = await inspect_client(c)
     info["source"] = parts.source
@@ -2573,15 +2592,22 @@ async def on_text(client: Client, m: Message):
         if not PHONE_RE.match(norm_phone(txt)):
             return await m.reply_text("That does not look like a phone. Try <code>+91…</code>")
         phone = norm_phone(txt)
-        tg = TelegramClient(StringSession(), API_ID, API_HASH, **_DEV)
-        await tg.connect()
+        tg = make_user_client()
         try:
-            sent = await tg.send_code_request(phone)
+            await tg.connect()
+            sent = await tg.send_code_request(str(phone))
         except PhoneNumberInvalidError:
-            await tg.disconnect()
+            try:
+                await tg.disconnect()
+            except Exception:
+                pass
             return await m.reply_text("Telegram rejected that number.")
         except Exception as e:  # noqa: BLE001
-            await tg.disconnect()
+            log.exception("send_code_request %s api_hash=%s", phone, type(getattr(tg, "api_hash", None)))
+            try:
+                await tg.disconnect()
+            except Exception:
+                pass
             return await m.reply_text(f"Could not send code: <code>{h(e)}</code>")
         fsm.live[m.from_user.id] = {"client": tg, "phone": phone, "hash": sent.phone_code_hash}
         fsm.set(m.from_user.id, "add_otp", phone=phone)
