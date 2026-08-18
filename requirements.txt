@@ -1,0 +1,23 @@
+# Session Manager Pro — Python 3.10+
+# Bot UI (Pyrogram-compatible maintained fork; drop-in `import pyrogram`)
+pyrofork>=2.3.45
+tgcrypto>=1.2.5
+
+# Account / session engine
+telethon>=1.36.0
+
+# TData / TDesktop conversion (optional — bot still runs if this fails to install)
+opentele>=1.15.1
+PyQt5>=5.15.10
+
+# Database
+motor>=3.6.0
+pymongo>=4.8.0
+
+# Crypto, files, config
+cryptography>=43.0.0
+aiofiles>=24.1.0
+python-dotenv>=1.0.1
+
+# Optional speed-up for Telethon crypto
+cryptg>=0.4.0
