@@ -7,11 +7,13 @@ services:
     startCommand: python bot.py
     healthCheckPath: /health
     envVars:
+      # opentele crashes on Python 3.13+ (Render default is 3.14). Pin 3.12.
       - key: PYTHON_VERSION
-        value: "3.11.9"
+        value: "3.12.10"
       - key: KEEP_ALIVE_INTERVAL
         value: "45"
-      # Optional: set after first deploy if RENDER_EXTERNAL_URL is missing
-      # - key: KEEP_ALIVE_URL
-      #   value: https://YOUR-APP.onrender.com
-      
+      - key: QT_QPA_PLATFORM
+        value: "offscreen"
+      - key: PYTHONUNBUFFERED
+        value: "1"
+        
