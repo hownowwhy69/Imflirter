@@ -120,7 +120,7 @@ TELEGRAM_SERVICE_ID = 777000
 SPAMBOT = "SpamBot"
 PER_PAGE = 8
 MAX_UPLOAD = 80 * 1024 * 1024
-CONCURRENCY = 3
+CONCURRENCY = 6
 HOST_CAP = 500
 IST = ZoneInfo("Asia/Kolkata")
 BOT_USERNAME = "sessionmanagerpromaxbot"
@@ -195,13 +195,95 @@ def h(v: Any) -> str:
     return html_lib.escape("" if v is None else str(v))
 
 
-def mask_phone(phone: str | None) -> str:
+def full_phone(phone: str | None) -> str:
     if not phone:
         return "—"
-    digits = re.sub(r"\D", "", phone)
-    if len(digits) < 6:
-        return phone
-    return f"+{digits[:2]}••••{digits[-4:]}"
+    digits = re.sub(r"\D", "", str(phone))
+    if not digits:
+        return str(phone)
+    return "+" + digits
+
+
+def mask_phone(phone: str | None) -> str:
+    """Full number — workspace is private to owner/admins."""
+    return full_phone(phone)
+
+
+def acc_username(acc: dict) -> str:
+    u = (acc.get("username") or "").strip().lstrip("@")
+    return f"@{u}" if u else "—"
+
+
+def estimate_reg_date(user_id) -> str:
+    """Telegram does not expose official signup date. Estimate from user id."""
+    try:
+        uid = int(user_id)
+    except (TypeError, ValueError):
+        return "—"
+    if uid <= 0:
+        return "—"
+    from datetime import date, timedelta
+    marks = [
+        (1, date(2013, 8, 1)),
+        (76_000, date(2013, 10, 1)),
+        (1_000_000, date(2013, 12, 1)),
+        (2_768_409, date(2014, 3, 1)),
+        (7_679_610, date(2014, 8, 1)),
+        (17_000_000, date(2015, 2, 1)),
+        (45_000_000, date(2015, 9, 1)),
+        (90_000_000, date(2016, 3, 1)),
+        (150_000_000, date(2016, 9, 1)),
+        (220_000_000, date(2017, 3, 1)),
+        (310_000_000, date(2017, 10, 1)),
+        (400_000_000, date(2018, 4, 1)),
+        (500_000_000, date(2018, 10, 1)),
+        (620_000_000, date(2019, 3, 1)),
+        (750_000_000, date(2019, 9, 1)),
+        (900_000_000, date(2020, 2, 1)),
+        (1_100_000_000, date(2020, 7, 1)),
+        (1_400_000_000, date(2020, 12, 1)),
+        (1_700_000_000, date(2021, 4, 1)),
+        (2_000_000_000, date(2021, 8, 1)),
+        (2_400_000_000, date(2021, 12, 1)),
+        (3_000_000_000, date(2022, 4, 1)),
+        (4_000_000_000, date(2022, 9, 1)),
+        (5_000_000_000, date(2023, 2, 1)),
+        (5_500_000_000, date(2023, 7, 1)),
+        (6_000_000_000, date(2023, 11, 1)),
+        (6_400_000_000, date(2024, 3, 1)),
+        (6_800_000_000, date(2024, 7, 1)),
+        (7_200_000_000, date(2024, 11, 1)),
+        (7_600_000_000, date(2025, 3, 1)),
+        (8_000_000_000, date(2025, 8, 1)),
+        (8_400_000_000, date(2026, 1, 1)),
+        (8_800_000_000, date(2026, 6, 1)),
+    ]
+    if uid >= marks[-1][0]:
+        return marks[-1][1].strftime("%b %Y") + " (est.)"
+    prev_id, prev_d = marks[0]
+    for mid, md in marks[1:]:
+        if uid <= mid:
+            span = max(mid - prev_id, 1)
+            frac = max(0.0, min(1.0, (uid - prev_id) / span))
+            est = prev_d + timedelta(days=int((md - prev_d).days * frac))
+            return est.strftime("%b %Y") + " (est.)"
+        prev_id, prev_d = mid, md
+    return "—"
+
+
+def acc_label(acc: dict, limit: int = 60) -> str:
+    flag = STATUS_EMOJI.get(acc.get("status"), "❓")
+    phone = full_phone(acc.get("phone"))
+    name = acc.get("first_name") or acc.get("account_id")
+    uname = acc_username(acc)
+    bits = [flag]
+    if phone != "—":
+        bits.append(phone)
+    bits.append(str(name))
+    if uname != "—":
+        bits.append(uname)
+    text = " ".join(bits)
+    return text if len(text) <= limit else text[: limit - 1] + "…"
 
 
 def norm_phone(raw: str) -> str:
@@ -911,7 +993,7 @@ async def check_spam(client) -> dict:
     except FloodWaitError as e:
         await asyncio.sleep(min(int(e.seconds) + 1, 30))
         await client.send_message(SPAMBOT, "/start")
-    await asyncio.sleep(2.2)
+    await asyncio.sleep(1.3)
     msgs = await client.get_messages(SPAMBOT, limit=5)
     text = next((m.message for m in msgs if m and m.message), "")
     low = text.lower()
@@ -1007,7 +1089,7 @@ async def clear_dms(client, progress=None) -> dict:
             errors += 1
         if progress and deleted % 8 == 0:
             await progress(deleted, errors)
-        await asyncio.sleep(0.15)
+        await asyncio.sleep(0.08)
     return {"deleted": deleted, "skipped": skipped, "errors": errors}
 
 
@@ -1035,7 +1117,7 @@ async def nuclear(client, progress=None) -> dict:
         total = stats["left_groups"] + stats["cleared_bots"] + stats["cleared_dms"]
         if progress and total % 6 == 0:
             await progress(stats)
-        await asyncio.sleep(0.18)
+        await asyncio.sleep(0.10)
     return stats
 
 
@@ -1133,10 +1215,7 @@ def cancel_kb():
 def accounts_kb(accounts, page, total, per):
     rows = []
     for acc in accounts:
-        flag = STATUS_EMOJI.get(acc.get("status"), "❓")
-        title = acc.get("first_name") or acc.get("phone") or acc.get("account_id")
-        uname = f" @{acc['username']}" if acc.get("username") else ""
-        rows.append([B(f"{flag} {title}{uname}", f"a:v:{acc['account_id']}")])
+        rows.append([B(acc_label(acc), f"a:v:{acc['account_id']}")])
     nav = []
     if page > 0:
         nav.append(B("⬅️", f"a:l:{page-1}"))
@@ -1145,6 +1224,7 @@ def accounts_kb(accounts, page, total, per):
     if nav:
         rows.append(nav)
     rows.append([B("🗑 Remove ALL", "a:wipe1"), B("🔄 Refresh", f"a:l:{page}")])
+    rows.append([B("Refresh dates 📅", "a:dnaA")])
     rows.append([B("⬅️ Main menu", "m:main")])
     return InlineKeyboardMarkup(rows)
 
@@ -1156,7 +1236,8 @@ def card_kb(i: str):
         [B("☠️ Kill session", f"s:k1:{i}"), B("🌍 Terminate others", f"s:t1:{i}")],
         [B("🧹 Clear DMs", f"k:d1:{i}"), B("☢️ Nuclear cleanup", f"k:n1:{i}")],
         [B("📄 String", f"c:ex:s:{i}"), B("🔑 Hex", f"c:ex:h:{i}"), B("📁 File", f"c:ex:f:{i}")],
-        [B("🗑 Remove", f"a:d1:{i}"), B("⬅️ Accounts", "a:l:0")],
+        [B("📅 Refresh date", f"a:dna:{i}"), B("🗑 Remove", f"a:d1:{i}")],
+        [B("⬅️ Accounts", "a:l:0")],
     ])
 
 
@@ -1222,15 +1303,21 @@ def admin_kb(owner):
 
 async def dashboard_stats() -> dict:
     """Live Mongo snapshot used by /start. Recalculated every time the dashboard is opened."""
-    hosted = await db.count_accounts()
-    online = await db.accounts.count_documents({"status": "active"})
-    dead = await db.accounts.count_documents({"status": {"$in": ["dead", "banned"]}})
-    with_pw = await db.accounts.count_documents({"has_2fa": True})
-    spam = await db.accounts.count_documents({"spam_status": "limited"})
-    clean = await db.accounts.count_documents({"spam_status": "clean"})
-    logout = await db.accounts.count_documents({"status": "dead"})
     start_today = datetime.now(IST).replace(hour=0, minute=0, second=0, microsecond=0)
-    added_today = await db.accounts.count_documents({"added_at": {"$gte": start_today}})
+    hosted, online, dead, with_pw, spam, clean, logout, added_today, deleted, otp_read, add_fail, add_ok = await asyncio.gather(
+        db.count_accounts(),
+        db.accounts.count_documents({"status": "active"}),
+        db.accounts.count_documents({"status": {"$in": ["dead", "banned"]}}),
+        db.accounts.count_documents({"has_2fa": True}),
+        db.accounts.count_documents({"spam_status": "limited"}),
+        db.accounts.count_documents({"spam_status": "clean"}),
+        db.accounts.count_documents({"status": "dead"}),
+        db.accounts.count_documents({"added_at": {"$gte": start_today}}),
+        db.get_setting("accounts_deleted", 0),
+        db.get_setting("otp_read", 0),
+        db.get_setting("add_fail", 0),
+        db.get_setting("add_ok", 0),
+    )
     return {
         "hosted": hosted,
         "online": online,
@@ -1240,10 +1327,10 @@ async def dashboard_stats() -> dict:
         "spam": spam,
         "clean": clean,
         "logout": logout,
-        "deleted": int(await db.get_setting("accounts_deleted", 0) or 0),
-        "otp_read": int(await db.get_setting("otp_read", 0) or 0),
-        "add_fail": int(await db.get_setting("add_fail", 0) or 0),
-        "add_ok": int(await db.get_setting("add_ok", 0) or 0),
+        "deleted": int(deleted or 0),
+        "otp_read": int(otp_read or 0),
+        "add_fail": int(add_fail or 0),
+        "add_ok": int(add_ok or 0),
         "added_today": added_today,
         "updated": datetime.now(IST).strftime("%d %b %Y · %I:%M %p"),
     }
@@ -1288,13 +1375,20 @@ def help_text() -> str:
 
 def account_card(acc: dict) -> str:
     emoji = STATUS_EMOJI.get(acc.get("status"), "❓")
-    uname = f"@{acc['username']}" if acc.get("username") else "—"
+    uname = acc_username(acc)
     full = " ".join(p for p in (acc.get("first_name"), acc.get("last_name")) if p) or "—"
+    phone = full_phone(acc.get("phone"))
+    stored = (acc.get("reg_date") or "").strip()
+    registered = stored if stored else estimate_reg_date(acc.get("user_id"))
+    if stored:
+        registered = f"{stored} · @TGDNAbot"
     return (
         f"{emoji} <b>{h(full)}</b>\n"
         f"ID: <code>{h(acc.get('account_id'))}</code>\n"
         f"Telegram: <code>{acc.get('user_id') or '—'}</code>\n"
-        f"Username: {h(uname)}\nPhone: <code>{h(mask_phone(acc.get('phone')))}</code>\n"
+        f"Username: <code>{h(uname)}</code>\n"
+        f"Phone: <code>{h(phone)}</code>\n"
+        f"Registered: <code>{h(registered)}</code>\n"
         f"DC: <code>{acc.get('dc_id') or '—'}</code>\nStatus: <code>{h(acc.get('status'))}</code>\n"
         f"Spam: <code>{h(acc.get('spam_status') or '—')}</code>\n"
         f"Source: <code>{h(acc.get('source') or '—')}</code>\n"
@@ -1558,6 +1652,12 @@ async def persist(bot: Client, event, info: dict, source: str, quiet=False, has_
                           f"Workspace id: <code>{doc['account_id']}</code> · DC {info.get('dc_id')}")
         await broadcast(bot, f"🔄 {h(user.first_name)} added an account via {source}\n"
                         f"<b>{h(label)}</b> · <code>{doc['account_id']}</code>", exclude=user.id)
+    chat_id = None
+    try:
+        chat_id = event.chat.id if getattr(event, "chat", None) is not None else event.message.chat.id
+    except Exception:
+        chat_id = None
+    asyncio.create_task(_dna_after_add(doc, None if quiet else chat_id))
     return doc
 
 
@@ -1584,6 +1684,166 @@ async def client_for(aid: str):
     return acc, tg_from_string(sec["telethon_string"], acc.get("api_id"))
 
 
+TGDNA = "TGDNAbot"
+_DNA_CREATED = re.compile(r"Created:\s*([0-9]{4}-[0-9]{2}(?:-[0-9]{2})?)", re.I)
+_DNA_USER = re.compile(r"Username:\s*(@?[A-Za-z0-9_]{3,}|—|-|None)", re.I)
+_DNA_PREM = re.compile(r"Premium:\s*([^\n]+)", re.I)
+_DNA_DC = re.compile(r"DC:\s*(\d+)", re.I)
+
+
+def parse_tgdna(text: str) -> dict:
+    out = {"reg_date": None, "username": None, "premium": None, "dc_id": None, "raw": text or ""}
+    if not text:
+        return out
+    m = _DNA_CREATED.search(text)
+    if m:
+        out["reg_date"] = m.group(1)
+    m = _DNA_USER.search(text)
+    if m:
+        u = m.group(1).strip()
+        if u and u.lower() not in {"—", "-", "none", "n/a"}:
+            out["username"] = u.lstrip("@")
+    m = _DNA_PREM.search(text)
+    if m:
+        out["premium"] = m.group(1).strip()[:40]
+    m = _DNA_DC.search(text)
+    if m:
+        out["dc_id"] = int(m.group(1))
+    return out
+
+
+async def tgdna_query(client, user_id: int, already_started: bool = False) -> dict:
+    entity = TGDNA
+    if not already_started:
+        try:
+            await client.send_message(entity, "/start")
+        except FloodWaitError as e:
+            await asyncio.sleep(min(int(e.seconds) + 1, 20))
+            await client.send_message(entity, "/start")
+        await asyncio.sleep(0.6)
+    sent = await client.send_message(entity, str(int(user_id)))
+    deadline = time.time() + 12
+    last_text = ""
+    while time.time() < deadline:
+        await asyncio.sleep(0.45)
+        msgs = await client.get_messages(entity, limit=6)
+        for msg in msgs:
+            if not msg or not msg.message:
+                continue
+            if sent and getattr(msg, "id", 0) < getattr(sent, "id", 0):
+                continue
+            if str(user_id) in msg.message or "Created:" in msg.message or "Created :" in msg.message:
+                last_text = msg.message
+                parsed = parse_tgdna(last_text)
+                if parsed.get("reg_date"):
+                    return parsed
+    return parse_tgdna(last_text)
+
+
+async def apply_dna(acc: dict, parsed: dict) -> dict:
+    updates = {}
+    if parsed.get("reg_date"):
+        updates["reg_date"] = parsed["reg_date"]
+        updates["reg_source"] = "tgdna"
+        updates["reg_checked_at"] = utcnow()
+    if parsed.get("username") and not acc.get("username"):
+        updates["username"] = parsed["username"]
+    if parsed.get("premium"):
+        updates["premium"] = parsed["premium"]
+    if parsed.get("dc_id") and not acc.get("dc_id"):
+        updates["dc_id"] = parsed["dc_id"]
+    if updates:
+        await db.update_account(acc["account_id"], updates)
+        acc.update(updates)
+    return acc
+
+
+async def dna_refresh_one(acc: dict) -> dict:
+    if not acc.get("user_id"):
+        raise RuntimeError("No Telegram user id on this account.")
+    _, tg = await client_for(acc["account_id"])
+    async with opened(tg, timeout=35):
+        parsed = await tgdna_query(tg, int(acc["user_id"]))
+    if not parsed.get("reg_date"):
+        raise RuntimeError("TGDNAbot did not return a Created date.")
+    await apply_dna(acc, parsed)
+    return parsed
+
+
+async def dna_refresh_all(progress=None) -> dict:
+    accs = await db.all_accounts()
+    stats = {"ok": 0, "fail": 0, "total": len(accs)}
+    worker = None
+    for acc in accs:
+        tg = None
+        try:
+            _, tg = await client_for(acc["account_id"])
+            await asyncio.wait_for(tg.connect(), timeout=20)
+            if await tg.is_user_authorized():
+                worker = tg
+                break
+            await tg.disconnect()
+        except Exception:
+            if tg is not None:
+                try:
+                    await tg.disconnect()
+                except Exception:
+                    pass
+    started = False
+    try:
+        if worker is not None:
+            try:
+                await worker.send_message(TGDNA, "/start")
+                await asyncio.sleep(0.5)
+                started = True
+            except Exception:
+                started = False
+        for i, acc in enumerate(accs, 1):
+            if not acc.get("user_id"):
+                stats["fail"] += 1
+                continue
+            try:
+                if worker is not None:
+                    parsed = await tgdna_query(worker, int(acc["user_id"]), already_started=started)
+                    started = True
+                else:
+                    parsed = await dna_refresh_one(acc)
+                    stats["ok"] += 1
+                    if progress:
+                        await progress(i, stats)
+                    continue
+                if parsed.get("reg_date"):
+                    await apply_dna(acc, parsed)
+                    stats["ok"] += 1
+                else:
+                    stats["fail"] += 1
+            except Exception:
+                log.exception("dna refresh %s", acc.get("account_id"))
+                stats["fail"] += 1
+            if progress:
+                await progress(i, stats)
+            await asyncio.sleep(0.35)
+    finally:
+        if worker is not None:
+            try:
+                await worker.disconnect()
+            except Exception:
+                pass
+    return stats
+
+
+async def _dna_after_add(doc: dict, chat_id: int | None) -> None:
+    try:
+        parsed = await dna_refresh_one(doc)
+        if chat_id and parsed.get("reg_date"):
+            extra = f" · @{parsed['username']}" if parsed.get("username") else ""
+            await botapi_send(chat_id, f"📅 Registered: <code>{h(parsed['reg_date'])}</code>{h(extra)}")
+    except Exception as exc:
+        log.warning("dna after add %s: %s", doc.get("account_id"), exc)
+
+
+
+
 # ═══════════════════════════════════════════════════════════════════
 # Monitor
 # ═══════════════════════════════════════════════════════════════════
@@ -1606,7 +1866,7 @@ class Monitor:
 
     async def _loop(self):
         try:
-            await asyncio.wait_for(self._stop.wait(), timeout=15)
+            await asyncio.wait_for(self._stop.wait(), timeout=5)
             return
         except asyncio.TimeoutError:
             pass
@@ -1787,6 +2047,44 @@ async def cb_view(_, cq: CallbackQuery):
     await cq.answer()
 
 
+@app.on_callback_query(filters.regex(r"^a:dna:([0-9a-f]+)$"))
+async def cb_dna_one(_, cq: CallbackQuery):
+    if not await ensure_admin(cq):
+        return
+    acc = await db.get_account(cq.data.split(":")[2])
+    if not acc:
+        return await cq.answer("Gone.", show_alert=True)
+    await cq.answer("Asking @TGDNAbot…")
+    try:
+        parsed = await dna_refresh_one(acc)
+        acc = await db.get_account(acc["account_id"])
+        await cq.message.edit_text(account_card(acc), reply_markup=card_kb(acc["account_id"]))
+        await cq.message.reply_text(f"📅 @TGDNAbot · <code>{h(parsed.get('reg_date'))}</code>")
+    except Exception as e:
+        await cq.message.reply_text(f"❌ Date refresh failed: <code>{h(e)}</code>")
+
+
+@app.on_callback_query(filters.regex(r"^a:dnaA$"))
+async def cb_dna_all(_, cq: CallbackQuery):
+    if not await ensure_admin(cq):
+        return
+    accs = await db.all_accounts()
+    if not accs:
+        return await cq.answer("No accounts.", show_alert=True)
+    await cq.answer("Refreshing dates…")
+    status = await cq.message.reply_text(f"📅 0/{len(accs)} via @TGDNAbot")
+
+    async def prog(i, st):
+        try:
+            await status.edit_text(f"📅 {i}/{st['total']} · ok {st['ok']} · fail {st['fail']}")
+        except Exception:
+            pass
+
+    stats = await dna_refresh_all(prog)
+    await status.edit_text(f"📅 Done. Updated <b>{stats['ok']}</b> · failed {stats['fail']}")
+    await render_list(cq, 0)
+
+
 @app.on_callback_query(filters.regex(r"^a:p:([0-9a-f]+)$"))
 async def cb_ping(_, cq: CallbackQuery):
     if not await ensure_admin(cq):
@@ -1878,8 +2176,7 @@ async def render_pick(cq: CallbackQuery, mode: str, page: int) -> None:
     rows = []
     for acc in accs:
         flag = STATUS_EMOJI.get(acc.get("status"), "❓")
-        title = acc.get("first_name") or acc.get("phone") or acc["account_id"]
-        rows.append([B(f"{flag} {title}", f"pg:{mode}:{acc['account_id']}")])
+        rows.append([B(acc_label(acc), f"pg:{mode}:{acc['account_id']}")])
     nav = []
     if page > 0:
         nav.append(B("⬅️", f"pk:{mode}:{page-1}"))
@@ -2357,7 +2654,7 @@ async def cb_spam_all(_, cq: CallbackQuery):
                 await status.edit_text(f"📊 {len(rows)}/{len(accs)}")
             except Exception:
                 pass
-            await asyncio.sleep(1.2)
+            await asyncio.sleep(0.7)
 
     await asyncio.gather(*(one(a) for a in accs))
     clean = sum(1 for _, f, __, ___ in rows if f == "clean")
@@ -2441,7 +2738,7 @@ async def cb_otp_all(_, cq: CallbackQuery):
                 await status.edit_text(f"📩 {i}/{len(accs)}")
             except Exception:
                 pass
-        await asyncio.sleep(0.4)
+        await asyncio.sleep(0.2)
     chunks = split_html("\n".join(lines))
     await status.edit_text(chunks[0], reply_markup=InlineKeyboardMarkup([[B("⬅️ OTP", "o:m")]]))
     for extra in chunks[1:]:
@@ -2951,6 +3248,8 @@ def _install_cb_routes() -> None:
         (r"^a:l:(\d+)$", cb_list),
         (r"^a:v:([0-9a-f]+)$", cb_view),
         (r"^a:p:([0-9a-f]+)$", cb_ping),
+        (r"^a:dna:([0-9a-f]+)$", cb_dna_one),
+        (r"^a:dnaA$", cb_dna_all),
         (r"^a:d1:([0-9a-f]+)$", cb_del_ask),
         (r"^a:dx:([0-9a-f]+)$", cb_del_do),
         (r"^a:wipe1$", cb_wipe_ask),
