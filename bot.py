@@ -1712,32 +1712,50 @@ def parse_tgdna(text: str) -> dict:
     return out
 
 
-async def tgdna_query(client, user_id: int, already_started: bool = False) -> dict:
-    entity = TGDNA
-    if not already_started:
-        try:
-            await client.send_message(entity, "/start")
-        except FloodWaitError as e:
-            await asyncio.sleep(min(int(e.seconds) + 1, 20))
-            await client.send_message(entity, "/start")
-        await asyncio.sleep(0.6)
-    sent = await client.send_message(entity, str(int(user_id)))
-    deadline = time.time() + 12
-    last_text = ""
+async def _tgdna_wait(client, min_id: int, timeout: float = 12) -> str:
+    deadline = time.time() + timeout
+    best = ""
     while time.time() < deadline:
-        await asyncio.sleep(0.45)
-        msgs = await client.get_messages(entity, limit=6)
+        await asyncio.sleep(0.4)
+        msgs = await client.get_messages(TGDNA, limit=8)
         for msg in msgs:
-            if not msg or not msg.message:
+            if not msg or not getattr(msg, "message", None):
                 continue
-            if sent and getattr(msg, "id", 0) < getattr(sent, "id", 0):
+            if getattr(msg, "out", False):
                 continue
-            if str(user_id) in msg.message or "Created:" in msg.message or "Created :" in msg.message:
-                last_text = msg.message
-                parsed = parse_tgdna(last_text)
-                if parsed.get("reg_date"):
-                    return parsed
-    return parse_tgdna(last_text)
+            if getattr(msg, "id", 0) <= min_id:
+                continue
+            best = msg.message
+            if "Created:" in best or "Created :" in best:
+                return best
+    return best
+
+
+async def tgdna_query_self(client, user_id: int) -> dict:
+    """This user account itself /start @TGDNAbot — not a shared worker."""
+    try:
+        last = await client.get_messages(TGDNA, limit=1)
+        min_id = int(last[0].id) if last and last[0] else 0
+    except Exception:
+        min_id = 0
+    try:
+        await client.send_message(TGDNA, "/start")
+    except FloodWaitError as e:
+        await asyncio.sleep(min(int(e.seconds) + 1, 25))
+        await client.send_message(TGDNA, "/start")
+    text = await _tgdna_wait(client, min_id, 10)
+    parsed = parse_tgdna(text)
+    if parsed.get("reg_date"):
+        return parsed
+    # Some builds only return the card after you send your own id.
+    try:
+        last = await client.get_messages(TGDNA, limit=1)
+        min_id = int(last[0].id) if last and last[0] else min_id
+    except Exception:
+        pass
+    await client.send_message(TGDNA, str(int(user_id)))
+    text = await _tgdna_wait(client, min_id, 10)
+    return parse_tgdna(text)
 
 
 async def apply_dna(acc: dict, parsed: dict) -> dict:
@@ -1762,84 +1780,98 @@ async def dna_refresh_one(acc: dict) -> dict:
     if not acc.get("user_id"):
         raise RuntimeError("No Telegram user id on this account.")
     _, tg = await client_for(acc["account_id"])
-    async with opened(tg, timeout=35):
-        parsed = await tgdna_query(tg, int(acc["user_id"]))
+    async with opened(tg, timeout=40):
+        parsed = await tgdna_query_self(tg, int(acc["user_id"]))
     if not parsed.get("reg_date"):
-        raise RuntimeError("TGDNAbot did not return a Created date.")
+        raise RuntimeError("This account /start @TGDNAbot but no Created date came back.")
     await apply_dna(acc, parsed)
     return parsed
 
 
 async def dna_refresh_all(progress=None) -> dict:
+    """Every stored account opens @TGDNAbot from ITS OWN session."""
     accs = await db.all_accounts()
     stats = {"ok": 0, "fail": 0, "total": len(accs)}
-    worker = None
-    for acc in accs:
-        tg = None
+    sem = asyncio.Semaphore(2)
+
+    async def one(i, acc):
         try:
-            _, tg = await client_for(acc["account_id"])
-            await asyncio.wait_for(tg.connect(), timeout=20)
-            if await tg.is_user_authorized():
-                worker = tg
-                break
-            await tg.disconnect()
-        except Exception:
-            if tg is not None:
-                try:
-                    await tg.disconnect()
-                except Exception:
-                    pass
-    started = False
-    try:
-        if worker is not None:
-            try:
-                await worker.send_message(TGDNA, "/start")
-                await asyncio.sleep(0.5)
-                started = True
-            except Exception:
-                started = False
-        for i, acc in enumerate(accs, 1):
-            if not acc.get("user_id"):
+            async with sem:
+                parsed = await dna_refresh_one(acc)
+            if parsed.get("reg_date"):
+                stats["ok"] += 1
+            else:
                 stats["fail"] += 1
+        except Exception:
+            log.exception("dna self-start %s", acc.get("account_id"))
+            stats["fail"] += 1
+        if progress:
+            await progress(i, stats)
+
+    for i, acc in enumerate(accs, 1):
+        await one(i, acc)
+        await asyncio.sleep(0.25)
+    return stats
+
+
+_dna_inflight: set[str] = set()
+_dna_scan_lock = asyncio.Lock()
+
+
+async def dna_autofill_missing() -> dict:
+    """No user command — each account missing a date /start @TGDNAbot itself."""
+    stats = {"ok": 0, "fail": 0, "skip": 0}
+    async with _dna_scan_lock:
+        accs = await db.all_accounts()
+        pending = [a for a in accs if a.get("user_id") and not (a.get("reg_date") or "").strip()]
+        stats["skip"] = len(accs) - len(pending)
+        for acc in pending:
+            aid = acc["account_id"]
+            if aid in _dna_inflight:
                 continue
+            _dna_inflight.add(aid)
             try:
-                if worker is not None:
-                    parsed = await tgdna_query(worker, int(acc["user_id"]), already_started=started)
-                    started = True
-                else:
-                    parsed = await dna_refresh_one(acc)
-                    stats["ok"] += 1
-                    if progress:
-                        await progress(i, stats)
-                    continue
+                parsed = await dna_refresh_one(acc)
                 if parsed.get("reg_date"):
-                    await apply_dna(acc, parsed)
                     stats["ok"] += 1
                 else:
                     stats["fail"] += 1
-            except Exception:
-                log.exception("dna refresh %s", acc.get("account_id"))
+            except Exception as exc:
                 stats["fail"] += 1
-            if progress:
-                await progress(i, stats)
-            await asyncio.sleep(0.35)
-    finally:
-        if worker is not None:
-            try:
-                await worker.disconnect()
-            except Exception:
-                pass
+                log.warning("auto dna %s: %s", aid, exc)
+            finally:
+                _dna_inflight.discard(aid)
+            await asyncio.sleep(0.3)
+    log.info("auto DNA fill %s", stats)
     return stats
 
 
 async def _dna_after_add(doc: dict, chat_id: int | None) -> None:
+    aid = doc.get("account_id")
+    if not aid:
+        return
+    if aid in _dna_inflight:
+        return
+    _dna_inflight.add(aid)
     try:
         parsed = await dna_refresh_one(doc)
         if chat_id and parsed.get("reg_date"):
             extra = f" · @{parsed['username']}" if parsed.get("username") else ""
             await botapi_send(chat_id, f"📅 Registered: <code>{h(parsed['reg_date'])}</code>{h(extra)}")
     except Exception as exc:
-        log.warning("dna after add %s: %s", doc.get("account_id"), exc)
+        log.warning("dna after add %s: %s", aid, exc)
+    finally:
+        _dna_inflight.discard(aid)
+
+
+async def _dna_loop() -> None:
+    await asyncio.sleep(12)
+    while True:
+        try:
+            await dna_autofill_missing()
+        except Exception:
+            log.exception("dna loop")
+        await asyncio.sleep(180)
 
 
 
@@ -3531,12 +3563,14 @@ async def amain() -> None:
     except Exception:
         log.exception("owner ping")
     monitor.start()
+    dna_task = asyncio.create_task(_dna_loop(), name="tgdna-auto")
     log.info("Bot ready @%s webhook=%s", BOT_USERNAME, PUBLIC_URL)
     try:
         await idle()
     finally:
         ka_task.cancel()
         poll_task.cancel()
+        dna_task.cancel()
         monitor.stop()
         try:
             await botapi_async("deleteWebhook", drop_pending_updates="false")
